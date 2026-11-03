@@ -1509,8 +1509,11 @@ def render_overview(assets: list[dict[str, Any]]) -> None:
             border=True,
         )
 
-    render_problem_summary(assets)
-    render_topology_map(assets)
+    map_column, problem_column = st.columns([1.7, 1], gap="medium")
+    with map_column:
+        render_topology_map(assets)
+    with problem_column:
+        render_problem_summary(assets)
 
     left, right = st.columns([1.5, 1], gap="medium")
     with left:
@@ -3070,37 +3073,59 @@ if st.session_state.get("must_change_password"):
     st.stop()
 
 is_admin = st.session_state.get("role") == "admin"
+sections = ["Visão geral", "Ativos", "Redes /24", "Histórico", "Análises"]
+if is_admin:
+    sections.extend(["Operação", "Usuários", "Auditoria"])
+section_icons = {
+    "Visão geral": ":material/dashboard: Visão geral",
+    "Ativos": ":material/devices: Ativos",
+    "Redes /24": ":material/hub: Redes /24",
+    "Histórico": ":material/history: Histórico",
+    "Análises": ":material/monitoring: Análises",
+    "Operação": ":material/tune: Operação",
+    "Usuários": ":material/group: Usuários",
+    "Auditoria": ":material/shield: Auditoria",
+}
 with st.sidebar:
     st.markdown("## :material/shield: SENTINELA 3.0")
-    st.caption("CENTRAL DE DEFESA CIBERNÉTICA")
+    st.caption("CENTRO DE OPERAÇÕES DE SEGURANÇA")
     st.divider()
     st.markdown(f"**{st.session_state['username']}** · {'Administrador' if is_admin else 'Visitante'}")
+    section = st.radio(
+        "NAVEGAÇÃO",
+        sections,
+        format_func=lambda value: section_icons[value],
+        label_visibility="visible",
+        key="navigation_section",
+    )
+    st.divider()
     if is_admin:
-        st.markdown("### Cadastrar ativo")
-        asset_kind = st.selectbox("Tipo de cadastro", ["IP", "Site", "Rede /24"])
-        with st.form("add_asset_form", clear_on_submit=True):
-            asset_name = st.text_input(
-                "Nome",
-                placeholder=(
-                    "Opcional · será usado Dispositivo <IP>"
-                    if asset_kind == "IP"
-                    else "Ex.: Servidor principal"
-                ),
-            )
-            target_label = {
-                "IP": "Endereço IP",
-                "Site": "URL ou domínio",
-                "Rede /24": "Faixa CIDR",
-            }[asset_kind]
-            target_placeholder = {
-                "IP": "192.168.1.1",
-                "Site": "https://exemplo.com",
-                "Rede /24": "192.168.1.0/24",
-            }[asset_kind]
-            asset_target = st.text_input(target_label, placeholder=target_placeholder)
-            add_clicked = st.form_submit_button(
-                "Adicionar ativo", type="primary", width="stretch"
-            )
+        add_clicked = False
+        with st.expander("Cadastrar ativo"):
+            asset_kind = st.selectbox("Tipo de cadastro", ["IP", "Site", "Rede /24"])
+            with st.form("add_asset_form", clear_on_submit=True):
+                asset_name = st.text_input(
+                    "Nome",
+                    placeholder=(
+                        "Opcional · será usado Dispositivo <IP>"
+                        if asset_kind == "IP"
+                        else "Ex.: Servidor principal"
+                    ),
+                )
+                target_label = {
+                    "IP": "Endereço IP",
+                    "Site": "URL ou domínio",
+                    "Rede /24": "Faixa CIDR",
+                }[asset_kind]
+                target_placeholder = {
+                    "IP": "192.168.1.1",
+                    "Site": "https://exemplo.com",
+                    "Rede /24": "192.168.1.0/24",
+                }[asset_kind]
+                asset_target = st.text_input(target_label, placeholder=target_placeholder)
+                add_clicked = st.form_submit_button(
+                    "Adicionar ativo", type="primary", width="stretch"
+                )
 
         if add_clicked:
             require_admin()
@@ -3179,8 +3204,6 @@ with st.sidebar:
         "Use a seção Operação para configurar monitoramento, relatórios e backup."
     )
 
-st.title("Sentinela 3.0")
-st.caption("Defesa cibernética · monitoramento, inventário e trilha de auditoria")
 flash = st.session_state.pop("flash", None)
 if flash:
     level, message = flash
@@ -3188,16 +3211,13 @@ if flash:
         st.warning(message)
     else:
         st.success(message)
-sections = ["Visão geral", "Ativos", "Redes /24", "Histórico", "Análises"]
-if is_admin:
-    sections.extend(["Operação", "Usuários", "Auditoria"])
-nav_col, action_col = st.columns([3, 1], vertical_alignment="bottom")
-with nav_col:
-    section = st.segmented_control(
-        "Seção",
-        sections,
-        default="Visão geral",
-        label_visibility="collapsed",
+header_title = "Painel de monitoramento" if section == "Visão geral" else section
+header_col, action_col = st.columns([3, 1], vertical_alignment="center")
+with header_col:
+    st.title(header_title)
+    st.caption(
+        f"SENTINELA 3.0  /  {section.upper()}  ·  "
+        f"{datetime.now().astimezone().strftime('%d/%m/%Y %H:%M:%S')}"
     )
 with action_col:
     check_clicked = (
