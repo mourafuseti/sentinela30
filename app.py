@@ -674,6 +674,47 @@ def list_checks(days: int = 7, limit: int = 1000) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def list_analytics_buckets(
+    days: int, asset_id: int | None = None
+) -> list[dict[str, Any]]:
+    bucket_seconds = 300 if days == 1 else 3600
+    cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat(
+        timespec="seconds"
+    )
+    filters = ["c.checked_at >= ?", "a.enabled = 1"]
+    parameters: list[Any] = [cutoff]
+    if asset_id is not None:
+        filters.append("c.asset_id = ?")
+        parameters.append(asset_id)
+
+    with database() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                datetime(
+                    (CAST(strftime('%s', c.checked_at) AS INTEGER) / ?) * ?,
+                    'unixepoch',
+                    'localtime'
+                ) AS time_bucket,
+                COUNT(*) AS total_checks,
+                SUM(CASE WHEN c.status = 'ONLINE' THEN 1 ELSE 0 END) AS online_checks,
+                SUM(CASE WHEN c.status = 'OFFLINE' THEN 1 ELSE 0 END) AS offline_checks,
+                AVG(CASE WHEN c.status = 'ONLINE' THEN c.latency_ms END) AS avg_latency_ms,
+                MIN(CASE WHEN c.status = 'ONLINE' THEN c.latency_ms END) AS min_latency_ms,
+                MAX(CASE WHEN c.status = 'ONLINE' THEN c.latency_ms END) AS max_latency_ms,
+                COUNT(CASE WHEN c.status = 'ONLINE' AND c.latency_ms IS NOT NULL THEN 1 END)
+                    AS latency_samples
+            FROM checks AS c
+            JOIN assets AS a ON a.id = c.asset_id
+            WHERE {" AND ".join(filters)}
+            GROUP BY time_bucket
+            ORDER BY time_bucket
+            """,
+            [bucket_seconds, bucket_seconds, *parameters],
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def normalize_site_url(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -1792,6 +1833,127 @@ def render_history() -> None:
     )
 
 
+def render_analytics() -> None:
+    st.subheader("Análise de disponibilidade e latência")
+    st.caption(
+        "Tendências calculadas a partir das verificações históricas. "
+        "A disponibilidade é a proporção de respostas online observadas, não um SLA."
+    )
+    assets = [asset for asset in list_assets() if asset["enabled"]]
+    filters = st.columns(2)
+    with filters[0]:
+        days = st.selectbox(
+            "Período da análise",
+            options=[1, 7, 30],
+            format_func=lambda value: {
+                1: "Últimas 24 horas",
+                7: "Últimos 7 dias",
+                30: "Últimos 30 dias",
+            }[value],
+            key="analytics_period",
+        )
+    with filters[1]:
+        selected_asset_id = st.selectbox(
+            "Ativo para análise",
+            options=[None, *[asset["id"] for asset in assets]],
+            format_func=lambda asset_id: (
+                "Todos os ativos habilitados"
+                if asset_id is None
+                else next(
+                    asset["name"] for asset in assets if asset["id"] == asset_id
+                )
+            ),
+            key="analytics_asset",
+        )
+
+    buckets = list_analytics_buckets(days, selected_asset_id)
+    if not buckets:
+        st.info(
+            "Ainda não há verificações no período. Mantenha a Visão geral aberta "
+            "como administrador ou use Verificar agora para gerar histórico."
+        )
+        return
+
+    total_checks = sum(bucket["total_checks"] for bucket in buckets)
+    online_checks = sum(bucket["online_checks"] for bucket in buckets)
+    offline_checks = sum(bucket["offline_checks"] for bucket in buckets)
+    latency_samples = sum(bucket["latency_samples"] for bucket in buckets)
+    weighted_latency = sum(
+        (bucket["avg_latency_ms"] or 0) * bucket["latency_samples"]
+        for bucket in buckets
+    )
+    availability = online_checks / total_checks * 100
+    average_latency = (
+        weighted_latency / latency_samples if latency_samples else None
+    )
+
+    with st.container(horizontal=True):
+        st.metric(
+            "Respostas online",
+            f"{availability:.2f}%",
+            border=True,
+        )
+        st.metric("Verificações", f"{total_checks:,}", border=True)
+        st.metric("Respostas offline", f"{offline_checks:,}", border=True)
+        st.metric(
+            "Latência média",
+            f"{average_latency:.1f} ms" if average_latency is not None else "—",
+            border=True,
+        )
+
+    chart_data = pd.DataFrame(buckets)
+    chart_data["Horário"] = pd.to_datetime(
+        chart_data["time_bucket"], format="mixed"
+    )
+    chart_data["Disponibilidade (%)"] = (
+        chart_data["online_checks"] / chart_data["total_checks"] * 100
+    )
+    chart_data["Latência média (ms)"] = chart_data["avg_latency_ms"]
+    chart_data["Online"] = chart_data["online_checks"]
+    chart_data["Offline"] = chart_data["offline_checks"]
+
+    left, right = st.columns(2, gap="medium")
+    with left:
+        with st.container(border=True):
+            st.subheader("Disponibilidade ao longo do tempo")
+            st.line_chart(
+                chart_data,
+                x="Horário",
+                y="Disponibilidade (%)",
+                x_label="Horário",
+                y_label="Respostas online (%)",
+                color="#5DD39E",
+                height=300,
+                alt="Percentual de verificações respondidas online por intervalo",
+            )
+    with right:
+        with st.container(border=True):
+            st.subheader("Latência média")
+            st.line_chart(
+                chart_data,
+                x="Horário",
+                y="Latência média (ms)",
+                x_label="Horário",
+                y_label="Latência (ms)",
+                color="#27C6DA",
+                height=300,
+                alt="Latência média das respostas online por intervalo",
+            )
+    with st.container(border=True):
+        st.subheader("Verificações online e offline")
+        st.bar_chart(
+            chart_data,
+            x="Horário",
+            y=["Online", "Offline"],
+            x_label="Horário",
+            y_label="Quantidade de verificações",
+            color=["#5DD39E", "#F27575"],
+            stack=True,
+            height=320,
+            alt="Contagem de verificações online e offline ao longo do tempo",
+        )
+
+
 def render_networks() -> None:
     networks = list_networks()
     is_admin = st.session_state.get("role") == "admin"
@@ -2219,6 +2381,8 @@ def render_live_section(section: str) -> None:
         render_networks()
     elif section == "Histórico":
         render_history()
+    elif section == "Análises":
+        render_analytics()
     elif section == "Usuários":
         render_users()
     elif section == "Auditoria":
@@ -2357,7 +2521,7 @@ if flash:
         st.warning(message)
     else:
         st.success(message)
-sections = ["Visão geral", "Ativos", "Redes /24", "Histórico"]
+sections = ["Visão geral", "Ativos", "Redes /24", "Histórico", "Análises"]
 if is_admin:
     sections.extend(["Usuários", "Auditoria"])
 nav_col, action_col = st.columns([3, 1], vertical_alignment="bottom")

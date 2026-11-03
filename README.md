@@ -35,6 +35,7 @@ O servidor está configurado para escutar somente em `127.0.0.1`. Para acesso po
 - **Sites:** teste HTTP/HTTPS; redirecionamentos não são seguidos.
 - **Monitoramento ao vivo:** na **Visão geral**, administradores verificam automaticamente a cada 3 segundos somente sites habilitados e IPs com porta TCP configurada. O monitoramento roda enquanto a sessão está aberta nessa tela; não executa Nmap nem varre sub-redes.
 - **Latência e disponibilidade:** a tabela e o gráfico da **Visão geral** se atualizam a cada ciclo. Uma amostra histórica é persistida no máximo a cada 60 segundos por ativo para evitar crescimento excessivo do banco; a leitura de status permanece em tempo real.
+- **Análises:** a seção **Análises** apresenta disponibilidade observada, contagens online/offline e latência média, com filtros por ativo e por período (24 horas, 7 dias ou 30 dias). As séries são agregadas em intervalos de cinco minutos ou uma hora para manter os gráficos legíveis.
 - **Alarme:** se um ativo habilitado ficar offline, uma sirene em loop aparece na **Visão geral** e para quando todos voltarem online. O navegador pode bloquear reprodução automática; nesse caso, use o controle de áudio exibido.
 - **Verificação manual:** o botão **Verificar agora** continua disponível fora da **Visão geral**, com timeout de 3 segundos por ativo.
 - **Redes /24:** cadastra faixas IPv4 para organizar e limitar os resultados importados ao inventário correto.
