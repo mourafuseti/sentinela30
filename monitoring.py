@@ -293,7 +293,8 @@ def active_alerts(db_path: Path) -> list[dict[str, Any]]:
             """
             SELECT a.id, a.name, a.target, l.checked_at, l.message,
                    l.consecutive_failures, l.alert_started_at,
-                   a.maintenance_until, a.maintenance_reason
+                   a.maintenance_until, a.maintenance_reason,
+                   a.kind, a.criticality, a.environment
             FROM live_status AS l
             JOIN assets AS a ON a.id = l.asset_id
             WHERE a.enabled = 1 AND l.status = 'OFFLINE'

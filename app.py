@@ -1509,6 +1509,9 @@ def render_overview(assets: list[dict[str, Any]]) -> None:
             border=True,
         )
 
+    render_problem_summary(assets)
+    render_topology_map(assets)
+
     left, right = st.columns([1.5, 1], gap="medium")
     with left:
         with st.container(border=True):
@@ -1614,6 +1617,166 @@ def render_overview(assets: list[dict[str, Any]]) -> None:
                     st.caption(format_timestamp(item["checked_at"]))
             else:
                 st.caption("Ainda não há verificações registradas.")
+
+
+def network_group_for_asset(
+    asset: dict[str, Any], networks: list[dict[str, Any]]
+) -> str:
+    if asset["kind"] != "IP":
+        return "Sites"
+    address = ipaddress.ip_address(asset["target"])
+    for network in networks:
+        if address in ipaddress.ip_network(network["cidr"], strict=True):
+            return f'{network["name"]} · {network["cidr"]}'
+    return "IPs sem rede associada"
+
+
+def graphviz_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def render_problem_summary(assets: list[dict[str, Any]]) -> None:
+    alerts = active_alerts(DATABASE_PATH)
+    severity_columns = ["Crítica", "Alta", "Média", "Baixa", "Não classificada"]
+    if not alerts:
+        with st.container(border=True):
+            st.subheader("Problemas por severidade")
+            st.success("Nenhum alerta ativo após falhas consecutivas.")
+        return
+
+    networks = list_networks()
+    asset_by_id = {asset["id"]: asset for asset in assets}
+    severity_by_criticality = {
+        "Crítica": "Crítica",
+        "Alta": "Alta",
+        "Média": "Média",
+        "Baixa": "Baixa",
+    }
+    counts: dict[str, dict[str, int]] = {}
+    for alert in alerts:
+        asset = asset_by_id.get(alert["id"])
+        group = (
+            network_group_for_asset(asset, networks)
+            if asset
+            else "Ativos não listados"
+        )
+        severity = severity_by_criticality.get(
+            alert.get("criticality"), "Não classificada"
+        )
+        counts.setdefault(
+            group, {column: 0 for column in severity_columns}
+        )[severity] += 1
+
+    rows = [
+        {"Grupo": group, **severity_counts}
+        for group, severity_counts in sorted(counts.items())
+    ]
+    with st.container(border=True):
+        st.subheader("Problemas por severidade")
+        st.dataframe(
+            pd.DataFrame(rows, columns=["Grupo", *severity_columns]),
+            hide_index=True,
+            width="stretch",
+            alt="Alertas ativos agrupados por rede e criticidade do inventário",
+        )
+        st.caption(
+            "Um problema entra nesta tabela após duas falhas consecutivas. "
+            "A severidade é baseada na criticidade cadastrada para o ativo."
+        )
+
+
+def render_topology_map(assets: list[dict[str, Any]]) -> None:
+    networks = list_networks()
+    ip_assets = [asset for asset in assets if asset["kind"] == "IP"]
+    site_assets = [asset for asset in assets if asset["kind"] == "Site"]
+    asset_groups: dict[str, list[dict[str, Any]]] = {}
+    for asset in ip_assets:
+        asset_groups.setdefault(network_group_for_asset(asset, networks), []).append(asset)
+
+    status_colors = {
+        "ONLINE": "#5DD39E",
+        "OFFLINE": "#F27575",
+        "PENDENTE": "#F2B84B",
+        "DISABLED": "#75849B",
+    }
+    lines = [
+        "digraph sentinela {",
+        'graph [rankdir=LR, bgcolor="#09111F", fontname="Arial", pad="0.25", nodesep="0.35", ranksep="0.7"];',
+        'node [shape=box, style="rounded,filled", fontname="Arial", fontsize=10, color="#26364A", fontcolor="#E7EEF8", fillcolor="#17263A", margin="0.15,0.10"];',
+        'edge [color="#60758A", style=dashed, arrowhead=none, penwidth=1.2];',
+    ]
+
+    network_node_ids: dict[str, str] = {}
+    for index, network in enumerate(networks):
+        network_node_ids[f'{network["name"]} · {network["cidr"]}'] = f"network_{index}"
+
+    for group_index, (group_name, group_assets) in enumerate(sorted(asset_groups.items())):
+        lines.append(f"subgraph cluster_{group_index} {{")
+        lines.append(f'label="{graphviz_escape(group_name)}"; color="#35516A"; style="rounded";')
+        network_node_id = network_node_ids.get(group_name)
+        if network_node_id:
+            lines.append(
+                f'{network_node_id} [label="{graphviz_escape(group_name)}", shape=folder, fillcolor="#15354A"];'
+            )
+        for asset_index, asset in enumerate(group_assets):
+            node_id = f"asset_{group_index}_{asset_index}"
+            if not asset["enabled"]:
+                color = status_colors["DISABLED"]
+                status = "Desabilitado"
+            elif asset["status"] == "ONLINE":
+                color = status_colors["ONLINE"]
+                status = "Online"
+            elif asset["status"] == "OFFLINE":
+                color = status_colors["OFFLINE"]
+                status = "Offline"
+            else:
+                color = status_colors["PENDENTE"]
+                status = "Pendente"
+            label = graphviz_escape(
+                f'{asset["name"]}\n{asset["target"]}\n{status}'
+            )
+            lines.append(
+                f'{node_id} [label="{label}", color="{color}", penwidth=2];'
+            )
+            if network_node_id:
+                lines.append(f"{network_node_id} -> {node_id};")
+        lines.append("}")
+
+    if site_assets:
+        lines.append("subgraph cluster_sites {")
+        lines.append('label="Sites cadastrados"; color="#35516A"; style="rounded";')
+        lines.append('sites_group [label="Sites monitorados", shape=folder, fillcolor="#15354A"];')
+        for index, asset in enumerate(site_assets):
+            if not asset["enabled"]:
+                color = status_colors["DISABLED"]
+                status = "Desabilitado"
+            elif asset["status"] == "ONLINE":
+                color = status_colors["ONLINE"]
+                status = "Online"
+            elif asset["status"] == "OFFLINE":
+                color = status_colors["OFFLINE"]
+                status = "Offline"
+            else:
+                color = status_colors["PENDENTE"]
+                status = "Pendente"
+            label = graphviz_escape(f'{asset["name"]}\n{asset["target"]}\n{status}')
+            lines.append(
+                f'site_{index} [label="{label}", color="{color}", penwidth=2];'
+            )
+            lines.append(f"sites_group -> site_{index};")
+        lines.append("}")
+
+    lines.append("}")
+    with st.container(border=True):
+        st.subheader("Topologia lógica cadastrada")
+        st.caption(
+            "Agrupamento visual pelos CIDRs cadastrados e pelos sites do inventário; "
+            "as linhas não representam enlaces físicos descobertos."
+        )
+        if not ip_assets and not site_assets:
+            st.info("Cadastre IPs ou sites para exibir o mapa lógico.")
+        else:
+            st.graphviz_chart("\n".join(lines), width="stretch")
 
 
 def render_assets(assets: list[dict[str, Any]]) -> None:

@@ -27,7 +27,9 @@ class MonitorCycleTests(unittest.TestCase):
                 port INTEGER,
                 enabled INTEGER NOT NULL,
                 maintenance_until TEXT,
-                maintenance_reason TEXT NOT NULL DEFAULT ''
+                maintenance_reason TEXT NOT NULL DEFAULT '',
+                criticality TEXT NOT NULL DEFAULT 'Média',
+                environment TEXT NOT NULL DEFAULT 'Laboratório'
             );
             CREATE TABLE live_status (
                 asset_id INTEGER PRIMARY KEY,
