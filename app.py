@@ -754,10 +754,10 @@ def list_checks(days: int = 7, limit: int = 1000) -> list[dict[str, Any]]:
 
 
 def list_analytics_buckets(
-    days: int, asset_id: int | None = None
+    hours: int, asset_id: int | None = None
 ) -> list[dict[str, Any]]:
-    bucket_seconds = 300 if days == 1 else 3600
-    cutoff = (datetime.now().astimezone() - timedelta(days=days)).isoformat(
+    bucket_seconds = 300 if hours <= 24 else 3600
+    cutoff = (datetime.now().astimezone() - timedelta(hours=hours)).isoformat(
         timespec="seconds"
     )
     filters = ["c.checked_at >= ?", "a.enabled = 1"]
@@ -1917,7 +1917,7 @@ def render_analytics() -> None:
             key="analytics_asset",
         )
 
-    buckets = list_analytics_buckets(days, selected_asset_id)
+    buckets = list_analytics_buckets(days * 24, selected_asset_id)
     if not buckets:
         st.info(
             "Ainda não há verificações no período. Mantenha a Visão geral aberta "
@@ -1992,8 +1992,31 @@ def render_analytics() -> None:
             )
     with st.container(border=True):
         st.subheader("Verificações online e offline")
+        chart_period_hours = st.selectbox(
+            "Período do gráfico",
+            options=[12, 24, 168, 720],
+            format_func=lambda value: {
+                12: "Últimas 12 horas",
+                24: "Últimas 24 horas",
+                168: "Últimos 7 dias",
+                720: "Últimos 30 dias",
+            }[value],
+            key="online_offline_period_hours",
+        )
+        online_offline_buckets = list_analytics_buckets(
+            chart_period_hours, selected_asset_id
+        )
+        if not online_offline_buckets:
+            st.info("Não há verificações no período selecionado para este gráfico.")
+            return
+        online_offline_data = pd.DataFrame(online_offline_buckets)
+        online_offline_data["Horário"] = pd.to_datetime(
+            online_offline_data["time_bucket"], format="mixed"
+        )
+        online_offline_data["Online"] = online_offline_data["online_checks"]
+        online_offline_data["Offline"] = online_offline_data["offline_checks"]
         st.bar_chart(
-            chart_data,
+            online_offline_data,
             x="Horário",
             y=["Online", "Offline"],
             x_label="Horário",
@@ -2001,7 +2024,10 @@ def render_analytics() -> None:
             color=["#5DD39E", "#F27575"],
             stack=True,
             height=320,
-            alt="Contagem de verificações online e offline ao longo do tempo",
+            alt=(
+                "Contagem de verificações online e offline ao longo do período "
+                "selecionado"
+            ),
         )
 
 
