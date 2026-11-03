@@ -5,32 +5,48 @@ import hmac
 import io
 import ipaddress
 import math
+import os
 import re
 import secrets
 import shutil
-import socket
 import sqlite3
 import struct
 import subprocess
+import tempfile
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
+from xml.sax.saxutils import escape
 from xml.etree import ElementTree
 
 import pandas as pd
-import requests
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from monitoring import (
+    active_alerts,
+    monitor_settings,
+    run_monitor_cycle,
+    set_app_setting,
+)
 
 
 DATABASE_PATH = Path(__file__).with_name("netwatch.db")
-CHECK_TIMEOUT_SECONDS = 3
 REFRESH_INTERVAL_SECONDS = 30
-LIVE_CHECK_INTERVAL_SECONDS = 3
-LIVE_HISTORY_SAMPLE_SECONDS = 60
+LIVE_CHECK_INTERVAL_SECONDS = 5
+MONITOR_INTERVAL_OPTIONS = (5, 15, 30, 60)
+DEFAULT_MONITOR_INTERVAL_SECONDS = 15
+DEFAULT_FAILURE_THRESHOLD = 2
+DEFAULT_ASSET_VALUES = {
+    "criticality": "Média",
+    "environment": "Laboratório",
+}
 MAX_NMAP_XML_BYTES = 5 * 1024 * 1024
 MAX_NMAP_TARGETS = 8
 NMAP_PORTS = (22, 53, 80, 443, 445, 3389, 8080)
@@ -58,6 +74,20 @@ def database() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+def add_missing_columns(
+    connection: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for column, definition in columns.items():
+        if column not in existing:
+            connection.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            )
+
+
 def initialize_database() -> None:
     with database() as connection:
         connection.execute(
@@ -72,6 +102,20 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL
             )
             """
+        )
+        add_missing_columns(
+            connection,
+            "assets",
+            {
+                "owner": "TEXT NOT NULL DEFAULT ''",
+                "criticality": "TEXT NOT NULL DEFAULT 'Média'",
+                "environment": "TEXT NOT NULL DEFAULT 'Laboratório'",
+                "location": "TEXT NOT NULL DEFAULT ''",
+                "tags": "TEXT NOT NULL DEFAULT ''",
+                "notes": "TEXT NOT NULL DEFAULT ''",
+                "maintenance_until": "TEXT",
+                "maintenance_reason": "TEXT NOT NULL DEFAULT ''",
+            },
         )
         connection.execute(
             """
@@ -97,6 +141,14 @@ def initialize_database() -> None:
                 FOREIGN KEY (asset_id) REFERENCES assets (id) ON DELETE CASCADE
             )
             """
+        )
+        add_missing_columns(
+            connection,
+            "live_status",
+            {
+                "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+                "alert_started_at": "TEXT",
+            },
         )
         connection.execute(
             """
@@ -176,6 +228,26 @@ def initialize_database() -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS audit_log_occurred ON audit_log (occurred_at DESC)"
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO app_settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            [
+                ("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL_SECONDS)),
+                ("monitor_mode", "dashboard"),
+                ("failure_threshold", str(DEFAULT_FAILURE_THRESHOLD)),
+                ("alert_snooze_until", ""),
+            ],
+        )
         user_count = connection.execute(
             "SELECT COUNT(*) FROM users"
         ).fetchone()[0]
@@ -218,6 +290,14 @@ def verify_password(password: str, salt_hex: str, expected_hash: str) -> bool:
         PASSWORD_HASH_ITERATIONS,
     ).hex()
     return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def set_authenticated_user(user: sqlite3.Row) -> None:
+    st.session_state["authenticated"] = True
+    st.session_state["user_id"] = user["id"]
+    st.session_state["username"] = user["username"]
+    st.session_state["role"] = user["role"]
+    st.session_state["must_change_password"] = bool(user["must_change_password"])
 
 
 def audit_event(action: str, details: str, username: str | None = None) -> None:
@@ -267,23 +347,17 @@ def authenticate(username: str, password: str) -> tuple[bool, str]:
             """,
             (clean_username,),
         ).fetchone()
-        authenticated = bool(
+        valid_password = bool(
             user
             and user["is_active"]
             and len(password) <= PASSWORD_MAX_LENGTH
             and verify_password(password, user["password_salt"], user["password_hash"])
         )
-        if authenticated:
+        if valid_password:
             connection.execute(
                 "DELETE FROM login_attempts WHERE username = ?", (clean_username,)
             )
-            st.session_state["authenticated"] = True
-            st.session_state["user_id"] = user["id"]
-            st.session_state["username"] = user["username"]
-            st.session_state["role"] = user["role"]
-            st.session_state["must_change_password"] = bool(
-                user["must_change_password"]
-            )
+            set_authenticated_user(user)
         else:
             if (
                 not attempt
@@ -338,7 +412,8 @@ def current_user_is_active() -> bool:
         return False
     with database() as connection:
         user = connection.execute(
-            "SELECT username, role, must_change_password, is_active FROM users WHERE id = ?",
+            "SELECT username, role, must_change_password, is_active "
+            "FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if not user or not user["is_active"]:
@@ -565,10 +640,14 @@ def list_assets() -> list[dict[str, Any]]:
         rows = connection.execute(
             """
             SELECT a.id, a.name, a.kind, a.target, a.port, a.enabled,
+                   a.owner, a.criticality, a.environment, a.location, a.tags,
+                   a.notes, a.maintenance_until, a.maintenance_reason,
                    COALESCE(l.checked_at, c.checked_at) AS checked_at,
                    CASE WHEN l.asset_id IS NOT NULL THEN l.status ELSE c.status END AS status,
                    CASE WHEN l.asset_id IS NOT NULL THEN l.latency_ms ELSE c.latency_ms END AS latency_ms,
                    CASE WHEN l.asset_id IS NOT NULL THEN l.message ELSE c.message END AS message,
+                   COALESCE(l.consecutive_failures, 0) AS consecutive_failures,
+                   l.alert_started_at,
                    d.hostname,
                    (
                        SELECT group_concat(
@@ -1088,62 +1167,6 @@ def run_nmap_scan(network_cidr: str, targets: list[str]) -> bytes:
     return result.stdout.encode("utf-8")
 
 
-def check_asset(asset: dict[str, Any]) -> dict[str, Any]:
-    started = datetime.now().astimezone()
-    try:
-        if asset["kind"] == "IP":
-            with socket.create_connection(
-                (asset["target"], int(asset["port"])), timeout=CHECK_TIMEOUT_SECONDS
-            ):
-                pass
-            message = f"Conexão TCP na porta {asset['port']} estabelecida."
-        else:
-            response = requests.head(
-                asset["target"],
-                timeout=CHECK_TIMEOUT_SECONDS,
-                allow_redirects=False,
-            )
-            try:
-                if response.status_code in {405, 501}:
-                    response.close()
-                    response = requests.get(
-                        asset["target"],
-                        timeout=CHECK_TIMEOUT_SECONDS,
-                        allow_redirects=False,
-                        stream=True,
-                    )
-                status_code = response.status_code
-            finally:
-                response.close()
-
-            if status_code >= 500:
-                raise requests.HTTPError(f"Site respondeu HTTP {status_code}.")
-            message = (
-                f"Resposta HTTP {status_code} (erro do cliente)."
-                if status_code >= 400
-                else f"Resposta HTTP {status_code}."
-            )
-
-        return {
-            "asset_id": asset["id"],
-            "checked_at": started.isoformat(timespec="seconds"),
-            "status": "ONLINE",
-            "latency_ms": round(
-                (datetime.now().astimezone() - started).total_seconds() * 1000, 1
-            ),
-            "message": message,
-        }
-    except (OSError, requests.RequestException) as error:
-        detail = str(error).strip() or error.__class__.__name__
-        return {
-            "asset_id": asset["id"],
-            "checked_at": started.isoformat(timespec="seconds"),
-            "status": "OFFLINE",
-            "latency_ms": None,
-            "message": detail[:240],
-        }
-
-
 def run_checks(assets: list[dict[str, Any]]) -> None:
     require_admin()
     enabled_assets = [asset for asset in assets if asset["enabled"]]
@@ -1162,125 +1185,54 @@ def run_checks(assets: list[dict[str, Any]]) -> None:
         )
         return
 
+    cycle_started = datetime.now().astimezone().replace(microsecond=0)
     with st.spinner(f"Verificando {len(checkable_assets)} ativo(s)..."):
-        with ThreadPoolExecutor(max_workers=min(12, len(checkable_assets))) as executor:
-            results = list(executor.map(check_asset, checkable_assets))
-
-    with database() as connection:
-        connection.executemany(
-            """
-            INSERT INTO checks (asset_id, checked_at, status, latency_ms, message)
-            VALUES (:asset_id, :checked_at, :status, :latency_ms, :message)
-            """,
-            results,
+        checked_count, skipped_assets = run_monitor_cycle(
+            DATABASE_PATH, st.session_state["username"], force=True
         )
-        connection.executemany(
-            """
-            INSERT INTO live_status (asset_id, checked_at, status, latency_ms, message)
-            VALUES (:asset_id, :checked_at, :status, :latency_ms, :message)
-            ON CONFLICT(asset_id) DO UPDATE SET
-                checked_at = excluded.checked_at,
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                message = excluded.message
-            """,
-            results,
-        )
-    audit_event("availability_check", f"Verificados {len(results)} ativo(s).")
-    online = sum(result["status"] == "ONLINE" for result in results)
+    current_assets = list_assets()
+    current_status = {
+        asset["id"]: asset["status"]
+        for asset in current_assets
+        if asset["checked_at"]
+        and datetime.fromisoformat(asset["checked_at"]) >= cycle_started
+    }
+    online = sum(
+        current_status.get(asset["id"]) == "ONLINE" for asset in checkable_assets
+    )
     skipped_message = (
-        f" {skipped_assets} IP(s) sem porta específica não foram testados."
+        f" {skipped_assets} ativo(s) sem verificação foram ignorados."
         if skipped_assets
         else ""
     )
     st.session_state["flash"] = (
-        "warning" if online != len(results) or skipped_assets else "success",
-        f"Verificação concluída: {online} online e {len(results) - online} offline."
+        "warning" if online != checked_count or skipped_assets else "success",
+        f"Verificação concluída: {online} online e "
+        f"{checked_count - online} offline."
         f"{skipped_message}",
     )
 
 
-def run_automatic_checks(assets: list[dict[str, Any]]) -> tuple[int, int]:
+def run_automatic_checks() -> tuple[int, int]:
     require_admin()
-    enabled_assets = [asset for asset in assets if asset["enabled"]]
-    checkable_assets = [
-        asset
-        for asset in enabled_assets
-        if asset["kind"] == "Site" or asset["port"] is not None
-    ]
-    skipped_assets = len(enabled_assets) - len(checkable_assets)
-    if not checkable_assets:
-        return 0, skipped_assets
-
-    with ThreadPoolExecutor(max_workers=min(12, len(checkable_assets))) as executor:
-        results = list(executor.map(check_asset, checkable_assets))
-
-    now = datetime.now().astimezone()
     with database() as connection:
-        previous_samples = {
-            row["asset_id"]: row["checked_at"]
-            for row in connection.execute(
-                """
-                SELECT asset_id, MAX(checked_at) AS checked_at
-                FROM checks
-                WHERE asset_id IN ({})
-                GROUP BY asset_id
-                """.format(",".join("?" for _ in checkable_assets)),
-                [asset["id"] for asset in checkable_assets],
-            ).fetchall()
-        }
-        previous_statuses = {
-            row["asset_id"]: row["status"]
-            for row in connection.execute(
-                "SELECT asset_id, status FROM live_status WHERE asset_id IN ({})".format(
-                    ",".join("?" for _ in checkable_assets)
-                ),
-                [asset["id"] for asset in checkable_assets],
-            ).fetchall()
-        }
-        connection.executemany(
-            """
-            INSERT INTO live_status (asset_id, checked_at, status, latency_ms, message)
-            VALUES (:asset_id, :checked_at, :status, :latency_ms, :message)
-            ON CONFLICT(asset_id) DO UPDATE SET
-                checked_at = excluded.checked_at,
-                status = excluded.status,
-                latency_ms = excluded.latency_ms,
-                message = excluded.message
-            """,
-            results,
-        )
-        samples_to_store = []
-        for result in results:
-            asset_id = result["asset_id"]
-            last_sample = previous_samples.get(asset_id)
-            if last_sample is None or (
-                now - datetime.fromisoformat(last_sample)
-            ).total_seconds() >= LIVE_HISTORY_SAMPLE_SECONDS:
-                samples_to_store.append(result)
+        settings = monitor_settings(connection)
+    if settings.get("monitor_mode", "dashboard") != "dashboard":
+        return 0, 0
 
-            previous_status = previous_statuses.get(asset_id)
-            if previous_status and previous_status != result["status"]:
-                asset_name = next(
-                    asset["name"] for asset in checkable_assets if asset["id"] == asset_id
-                )
-                insert_audit_event(
-                    connection,
-                    result["checked_at"],
-                    "monitoramento",
-                    "asset_status_changed",
-                    f"{asset_name}: {previous_status} → {result['status']}.",
-                )
-        if samples_to_store:
-            connection.executemany(
-                """
-                INSERT INTO checks (asset_id, checked_at, status, latency_ms, message)
-                VALUES (:asset_id, :checked_at, :status, :latency_ms, :message)
-                """,
-                samples_to_store,
-            )
-
-    return len(checkable_assets), skipped_assets
+    last_cycle = settings.get("monitor_last_cycle")
+    interval = int(
+        settings.get("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL_SECONDS))
+    )
+    if last_cycle and (
+        datetime.now().astimezone() - datetime.fromisoformat(last_cycle)
+    ).total_seconds() < interval:
+        return 0, 0
+    return run_monitor_cycle(
+        DATABASE_PATH,
+        st.session_state["username"],
+        expected_mode="dashboard",
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -1690,7 +1642,13 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
             "Hostname (XML)": (
                 asset["hostname"] or "—" if asset["kind"] == "IP" else "—"
             ),
+            "Responsável": asset["owner"] or "—",
+            "Criticidade": asset["criticality"],
+            "Ambiente": asset["environment"],
             "Monitoramento": "Habilitado" if asset["enabled"] else "Desabilitado",
+            "Manutenção até": format_timestamp(asset["maintenance_until"])
+            if asset["maintenance_until"]
+            else "—",
             "Status": asset["status"] or "Pendente",
             "Última verificação": format_timestamp(asset["checked_at"]),
         }
@@ -1714,6 +1672,16 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
         ),
     )
     selected = next(asset for asset in assets if asset["id"] == selected_id)
+    maintenance_until = selected["maintenance_until"]
+    maintenance_datetime = (
+        datetime.fromisoformat(maintenance_until)
+        if maintenance_until
+        else datetime.now().astimezone() + timedelta(hours=1)
+    )
+    maintenance_active = bool(
+        maintenance_until
+        and maintenance_datetime > datetime.now().astimezone()
+    )
     with st.form("edit_asset_form"):
         name = st.text_input("Nome do ativo", value=selected["name"], max_chars=80)
         if selected["kind"] == "IP":
@@ -1723,23 +1691,83 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
                 value=selected["port"] is not None,
                 key=f"asset_port_enabled_{selected_id}",
             )
-            port = (
-                st.number_input(
-                    "Porta TCP para verificação",
-                    min_value=1,
-                    max_value=65535,
-                    value=int(selected["port"] or 443),
-                    step=1,
-                    key=f"asset_port_{selected_id}",
-                )
-                if check_specific_port
-                else None
+            port_choice = st.number_input(
+                "Porta TCP (usada somente se a opção estiver marcada)",
+                min_value=1,
+                max_value=65535,
+                value=int(selected["port"] or 443),
+                step=1,
+                key=f"asset_port_{selected_id}",
             )
+            port = int(port_choice) if check_specific_port else None
         else:
             target_input = st.text_input("URL do site", value=selected["target"])
             port = None
         enabled = st.checkbox(
             "Monitoramento habilitado", value=bool(selected["enabled"])
+        )
+        inventory_columns = st.columns(2)
+        with inventory_columns[0]:
+            owner = st.text_input(
+                "Responsável",
+                value=selected["owner"],
+                max_chars=100,
+            )
+            criticality = st.selectbox(
+                "Criticidade",
+                options=["Baixa", "Média", "Alta", "Crítica"],
+                index=["Baixa", "Média", "Alta", "Crítica"].index(
+                    selected["criticality"]
+                    if selected["criticality"] in {"Baixa", "Média", "Alta", "Crítica"}
+                    else DEFAULT_ASSET_VALUES["criticality"]
+                ),
+            )
+            location = st.text_input(
+                "Localização",
+                value=selected["location"],
+                max_chars=120,
+            )
+        with inventory_columns[1]:
+            environment = st.text_input(
+                "Ambiente",
+                value=selected["environment"],
+                max_chars=80,
+            )
+            tags = st.text_input(
+                "Tags (separadas por vírgula)",
+                value=selected["tags"],
+                max_chars=200,
+            )
+        notes = st.text_area(
+            "Observações",
+            value=selected["notes"],
+            max_chars=500,
+        )
+        maintenance_enabled = st.checkbox(
+            "Agendar manutenção (suspende sondagens e sirene até o horário)",
+            value=maintenance_active,
+            key=f"asset_maintenance_enabled_{selected_id}",
+        )
+        maintenance_columns = st.columns(2)
+        maintenance_date = maintenance_columns[0].date_input(
+            "Data de término da manutenção",
+            value=maintenance_datetime.date(),
+            key=f"asset_maintenance_date_{selected_id}",
+        )
+        maintenance_time = maintenance_columns[1].time_input(
+            "Horário de término da manutenção",
+            value=maintenance_datetime.time()
+            .replace(second=0, microsecond=0, tzinfo=None),
+            key=f"asset_maintenance_time_{selected_id}",
+        )
+        maintenance_reason = st.text_input(
+            "Motivo da manutenção",
+            value=selected["maintenance_reason"],
+            max_chars=200,
+            key=f"asset_maintenance_reason_{selected_id}",
+        )
+        st.caption(
+            "Data, horário e motivo só serão aplicados se a manutenção estiver agendada."
         )
         save, remove = st.columns(2)
         save_clicked = save.form_submit_button(
@@ -1756,11 +1784,26 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
             if not clean_name:
                 raise ValueError("Informe um nome para o ativo.")
             clean_target = validate_target(selected["kind"], target_input)
+            clean_environment = environment.strip() or DEFAULT_ASSET_VALUES["environment"]
+            scheduled_maintenance = (
+                datetime.combine(maintenance_date, maintenance_time)
+                .astimezone()
+                .isoformat(timespec="seconds")
+                if maintenance_enabled and maintenance_date and maintenance_time
+                else None
+            )
+            if scheduled_maintenance and (
+                datetime.fromisoformat(scheduled_maintenance)
+                <= datetime.now().astimezone()
+            ):
+                raise ValueError("O término da manutenção deve ser no futuro.")
             with database() as connection:
                 connection.execute(
                     """
                     UPDATE assets
-                    SET name = ?, target = ?, port = ?, enabled = ?
+                    SET name = ?, target = ?, port = ?, enabled = ?, owner = ?,
+                        criticality = ?, environment = ?, location = ?, tags = ?,
+                        notes = ?, maintenance_until = ?, maintenance_reason = ?
                     WHERE id = ?
                     """,
                     (
@@ -1768,6 +1811,14 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
                         clean_target,
                         port,
                         int(enabled),
+                        owner.strip(),
+                        criticality,
+                        clean_environment,
+                        location.strip(),
+                        tags.strip(),
+                        notes.strip(),
+                        scheduled_maintenance,
+                        maintenance_reason.strip(),
                         selected_id,
                     ),
                 )
@@ -1952,6 +2003,387 @@ def render_analytics() -> None:
             height=320,
             alt="Contagem de verificações online e offline ao longo do tempo",
         )
+
+
+def build_pdf_report(history: list[dict[str, Any]]) -> bytes:
+    output = io.BytesIO()
+    styles = getSampleStyleSheet()
+    table_data = [
+        [
+            Paragraph(label, styles["BodyText"])
+            for label in ("Data e hora", "Ativo", "Tipo", "Endereço", "Status", "Latência")
+        ]
+    ]
+    for item in history:
+        table_data.append(
+            [
+                Paragraph(escape(format_timestamp(item["checked_at"])), styles["BodyText"]),
+                Paragraph(escape(str(item["name"])[:80]), styles["BodyText"]),
+                Paragraph(escape(str(item["kind"])), styles["BodyText"]),
+                Paragraph(escape(str(item["target"])[:100]), styles["BodyText"]),
+                Paragraph(
+                    "Online" if item["status"] == "ONLINE" else "Offline",
+                    styles["BodyText"],
+                ),
+                Paragraph(
+                    f'{item["latency_ms"]:.1f} ms'
+                    if item["latency_ms"] is not None
+                    else "—",
+                    styles["BodyText"],
+                ),
+            ]
+        )
+    document = SimpleDocTemplate(
+        output,
+        pagesize=landscape(A4),
+        title="Relatório Sentinela 3.0",
+    )
+    table = Table(table_data, colWidths=[100, 145, 45, 280, 55, 60], repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#15354A")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B7C7D1")),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#EEF4F7")]),
+            ]
+        )
+    )
+    document.build(
+        [
+            Paragraph("Sentinela 3.0 · Relatório de monitoramento", styles["Title"]),
+            Spacer(1, 10),
+            Paragraph(
+                f"Gerado em {datetime.now().astimezone().strftime('%d/%m/%Y %H:%M:%S')} "
+                f"· {len(history)} verificações",
+                styles["Normal"],
+            ),
+            Spacer(1, 12),
+            table,
+        ]
+    )
+    return output.getvalue()
+
+
+def create_database_backup() -> bytes:
+    with tempfile.NamedTemporaryFile(
+        prefix="sentinela-backup-", suffix=".sqlite3", dir=DATABASE_PATH.parent, delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    source = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        destination = sqlite3.connect(temporary_path, timeout=10)
+        try:
+            source.backup(destination)
+            destination.commit()
+        finally:
+            destination.close()
+        return temporary_path.read_bytes()
+    finally:
+        source.close()
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def restore_database_backup(content: bytes) -> Path:
+    if not content or len(content) > 100 * 1024 * 1024:
+        raise ValueError("O arquivo está vazio ou excede o limite de 100 MB.")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="sentinela-restore-",
+            suffix=".sqlite3",
+            dir=DATABASE_PATH.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+        validation = sqlite3.connect(temporary_path, timeout=10)
+        try:
+            integrity = validation.execute("PRAGMA quick_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise ValueError("O banco enviado não passou na verificação de integridade.")
+            tables = {
+                row[0]
+                for row in validation.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            required_tables = {"assets", "checks", "users", "audit_log", "networks"}
+            if not required_tables.issubset(tables):
+                raise ValueError("O arquivo não é um backup válido do Sentinela.")
+            required_columns = {
+                "assets": {
+                    "id",
+                    "name",
+                    "kind",
+                    "target",
+                    "port",
+                    "enabled",
+                    "created_at",
+                },
+                "checks": {
+                    "id",
+                    "asset_id",
+                    "checked_at",
+                    "status",
+                    "latency_ms",
+                    "message",
+                },
+                "users": {
+                    "id",
+                    "username",
+                    "password_salt",
+                    "password_hash",
+                    "role",
+                    "must_change_password",
+                    "is_active",
+                    "created_at",
+                    "updated_at",
+                },
+                "audit_log": {"id", "occurred_at", "username", "action", "details"},
+                "networks": {"id", "name", "cidr", "created_at"},
+            }
+            for table, expected_columns in required_columns.items():
+                actual_columns = {
+                    row[1]
+                    for row in validation.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+                if not expected_columns.issubset(actual_columns):
+                    raise ValueError(
+                        "O backup está incompleto ou usa um formato incompatível."
+                    )
+            if validation.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+                raise ValueError("O backup não contém contas de usuário.")
+        finally:
+            validation.close()
+
+        backup_path = DATABASE_PATH.with_name(
+            f"netwatch-before-restore-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.bak"
+        )
+        backup_path.write_bytes(create_database_backup())
+        os.replace(temporary_path, DATABASE_PATH)
+        temporary_path = None
+        initialize_database()
+        return backup_path
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def render_operations() -> None:
+    require_admin()
+    st.subheader("Operação, relatórios e backup")
+    st.caption(
+        "O modo selecionado impede ciclos duplicados entre o painel e o processo "
+        "separado. As sondagens continuam restritas a sites e portas cadastrados."
+    )
+    with database() as connection:
+        settings = monitor_settings(connection)
+        snooze_row = connection.execute(
+            "SELECT value FROM app_settings WHERE key = 'alert_snooze_until'"
+        ).fetchone()
+
+    interval = int(
+        settings.get("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL_SECONDS))
+    )
+    mode = settings.get("monitor_mode", "dashboard")
+    with st.form("monitor_settings_form"):
+        interval_choice = st.selectbox(
+            "Intervalo do monitoramento",
+            options=MONITOR_INTERVAL_OPTIONS,
+            index=MONITOR_INTERVAL_OPTIONS.index(interval)
+            if interval in MONITOR_INTERVAL_OPTIONS
+            else MONITOR_INTERVAL_OPTIONS.index(DEFAULT_MONITOR_INTERVAL_SECONDS),
+            format_func=lambda value: f"{value} segundos",
+        )
+        mode_choice = st.selectbox(
+            "Onde executar",
+            options=["dashboard", "worker", "disabled"],
+            index=["dashboard", "worker", "disabled"].index(mode)
+            if mode in {"dashboard", "worker", "disabled"}
+            else 0,
+            format_func=lambda value: {
+                "dashboard": "Painel Streamlit (Visão geral)",
+                "worker": "Processo separado / Agendador do Windows",
+                "disabled": "Desativado (somente verificações manuais)",
+            }[value],
+        )
+        save_monitor_settings = st.form_submit_button(
+            "Salvar configuração", type="primary"
+        )
+    if save_monitor_settings:
+        with database() as connection:
+            connection.executemany(
+                """
+                INSERT INTO app_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                [
+                    ("monitor_interval_seconds", str(interval_choice)),
+                    ("monitor_mode", mode_choice),
+                    ("failure_threshold", str(DEFAULT_FAILURE_THRESHOLD)),
+                ],
+            )
+        audit_event(
+            "monitor_settings_updated",
+            f"Modo {mode_choice}; intervalo {interval_choice}s; "
+            f"alerta após {DEFAULT_FAILURE_THRESHOLD} falhas.",
+        )
+        st.success("Configuração do monitoramento salva.")
+        st.rerun()
+
+    if mode == "worker":
+        st.code(
+            "python monitor_worker.py\n"
+            "python monitor_worker.py --once",
+            language="powershell",
+        )
+        st.caption(
+            "Use o primeiro comando para manter o monitor em execução contínua. "
+            "O segundo executa um ciclo e encerra, para configurar no Agendador "
+            "de Tarefas do Windows."
+        )
+    st.info(
+        f"Os alertas são ativados após {DEFAULT_FAILURE_THRESHOLD} falhas "
+        "consecutivas. Ativos em manutenção são temporariamente silenciados."
+    )
+    snooze_columns = st.columns([1, 1, 2])
+    with snooze_columns[0]:
+        snooze_minutes = st.selectbox(
+            "Silenciar por",
+            options=[30, 60, 240, 480],
+            format_func=lambda value: {
+                30: "30 minutos",
+                60: "1 hora",
+                240: "4 horas",
+                480: "8 horas",
+            }[value],
+            key="alert_snooze_duration",
+        )
+    with snooze_columns[1]:
+        if st.button("Silenciar alertas", key="silence_alerts"):
+            until = datetime.now().astimezone() + timedelta(minutes=snooze_minutes)
+            set_app_setting(
+                DATABASE_PATH,
+                "alert_snooze_until",
+                until.isoformat(timespec="seconds"),
+            )
+            audit_event("alerts_snoozed", f"Alertas silenciados até {until.isoformat()}.")
+            st.rerun()
+    with snooze_columns[2]:
+        if snooze_row and snooze_row["value"]:
+            snooze_until = datetime.fromisoformat(snooze_row["value"])
+            if snooze_until > datetime.now().astimezone():
+                st.caption(f"Alertas silenciados até {format_timestamp(snooze_row['value'])}.")
+            else:
+                st.caption("Alertas não estão silenciados.")
+        else:
+            st.caption("Alertas não estão silenciados.")
+    if snooze_row and snooze_row["value"] and st.button(
+        "Reativar alertas", key="unsilence_alerts"
+    ):
+        set_app_setting(DATABASE_PATH, "alert_snooze_until", "")
+        audit_event("alerts_unsnoozed", "Silenciamento dos alertas removido.")
+        st.rerun()
+
+    st.markdown("### Exportar relatório")
+    report_days = st.selectbox(
+        "Período do relatório",
+        options=[1, 7, 30],
+        format_func=lambda value: {
+            1: "Últimas 24 horas",
+            7: "Últimos 7 dias",
+            30: "Últimos 30 dias",
+        }[value],
+        key="report_period",
+    )
+    history = list_checks(days=report_days, limit=10000)
+    if history:
+        csv_rows = [
+            {
+                "Data e hora": item["checked_at"],
+                "Ativo": item["name"],
+                "Tipo": item["kind"],
+                "Endereço": item["target"],
+                "Status": item["status"],
+                "Latência (ms)": item["latency_ms"],
+                "Detalhe": item["message"],
+            }
+            for item in history
+        ]
+        csv_data = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8-sig")
+        pdf_data = build_pdf_report(history)
+        export_columns = st.columns(2)
+        export_columns[0].download_button(
+            "Baixar CSV",
+            data=csv_data,
+            file_name=f"sentinela-relatorio-{report_days}d.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        export_columns[1].download_button(
+            "Baixar PDF",
+            data=pdf_data,
+            file_name=f"sentinela-relatorio-{report_days}d.pdf",
+            mime="application/pdf",
+            width="stretch",
+        )
+        st.caption(f"{len(history)} registros no período.")
+    else:
+        st.info("Não há verificações para exportar no período selecionado.")
+
+    st.markdown("### Backup e restauração")
+    backup_columns = st.columns([1, 2])
+    with backup_columns[0]:
+        if st.button("Preparar backup do banco", width="stretch"):
+            st.session_state["prepared_backup"] = create_database_backup()
+            st.session_state["prepared_backup_name"] = (
+                f"sentinela-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.sqlite3"
+            )
+        if st.session_state.get("prepared_backup"):
+            st.download_button(
+                "Baixar backup preparado",
+                data=st.session_state["prepared_backup"],
+                file_name=st.session_state["prepared_backup_name"],
+                mime="application/vnd.sqlite3",
+                width="stretch",
+            )
+    with st.expander("Restaurar backup"):
+        st.warning(
+            "A restauração substitui os dados atuais. Antes da troca, o sistema "
+            "cria um backup de segurança ao lado do banco."
+        )
+        restore_file = st.file_uploader(
+            "Arquivo de backup SQLite do Sentinela (máximo 100 MB)",
+            type=["sqlite3", "db", "bak"],
+            key="restore_backup_file",
+        )
+        confirm_restore = st.checkbox(
+            "Confirmo que quero substituir os dados atuais pelo backup."
+        )
+        restore_clicked = st.button(
+            "Validar e restaurar backup",
+            type="primary",
+            disabled=restore_file is None or not confirm_restore,
+        )
+        if restore_clicked and restore_file is not None:
+            try:
+                backup_path = restore_database_backup(restore_file.getvalue())
+                audit_event(
+                    "database_restored",
+                    f"Backup restaurado; cópia anterior preservada em {backup_path.name}.",
+                )
+                st.success(
+                    f"Backup restaurado. Cópia anterior: {backup_path.name}"
+                )
+                st.rerun()
+            except (OSError, sqlite3.Error, ValueError) as error:
+                st.error(f"Não foi possível restaurar o backup: {error}")
 
 
 def render_networks() -> None:
@@ -2310,30 +2742,60 @@ def render_networks() -> None:
 @st.fragment(run_every=LIVE_CHECK_INTERVAL_SECONDS, key="live_overview")
 def render_live_overview() -> None:
     if not current_user_is_active():
-        for key in ("authenticated", "user_id", "username", "role", "must_change_password"):
+        for key in (
+            "authenticated",
+            "user_id",
+            "username",
+            "role",
+            "must_change_password",
+        ):
             st.session_state.pop(key, None)
         st.rerun()
 
     assets = list_assets()
+    with database() as connection:
+        settings = monitor_settings(connection)
+    interval = int(
+        settings.get("monitor_interval_seconds", str(DEFAULT_MONITOR_INTERVAL_SECONDS))
+    )
+    mode = settings.get("monitor_mode", "dashboard")
     if st.session_state.get("role") == "admin":
-        checkable_count, skipped_count = run_automatic_checks(assets)
+        checkable_count, skipped_count = run_automatic_checks()
         assets = list_assets()
     else:
         checkable_count = 0
         skipped_count = 0
 
+    update_caption = (
+        f"Monitoramento no painel: ciclo a cada {interval} segundos"
+        if mode == "dashboard"
+        else "Monitoramento em processo separado"
+        if mode == "worker"
+        else "Monitoramento automático desativado"
+    )
     st.caption(
-        f"Verificação automática a cada {LIVE_CHECK_INTERVAL_SECONDS} segundos · "
+        f"{update_caption} · tela atualizada a cada {LIVE_CHECK_INTERVAL_SECONDS}s · "
         f"Última atualização: {datetime.now().astimezone().strftime('%H:%M:%S')}"
     )
     if st.session_state.get("role") != "admin":
         st.caption(
             "Perfil Visitante: exibe o último status registrado, sem iniciar verificações."
         )
-    if st.session_state.get("role") == "admin" and checkable_count == 0:
+    enabled_checkable = [
+        asset for asset in assets
+        if asset["enabled"] and (asset["kind"] == "Site" or asset["port"] is not None)
+    ]
+    if st.session_state.get("role") == "admin" and not enabled_checkable:
+        st.info("Nenhum ativo habilitado tem uma porta TCP ou URL configurada.")
+    elif mode == "worker":
         st.info(
-            "Nenhum ativo habilitado tem uma porta TCP ou URL configurada para monitoramento."
+            "O modo em segundo plano está selecionado. Execute monitor_worker.py "
+            "ou configure-o no Agendador de Tarefas do Windows."
         )
+    elif mode == "disabled":
+        st.info("As verificações automáticas estão desativadas.")
+    elif st.session_state.get("role") == "admin" and checkable_count == 0:
+        st.caption("Aguardando o próximo ciclo de monitoramento.")
     if skipped_count:
         st.caption(
             f"{skipped_count} ativo(s) habilitado(s), sem porta configurada, "
@@ -2341,19 +2803,18 @@ def render_live_overview() -> None:
         )
 
     render_overview(assets)
-    offline_assets = [
-        asset for asset in assets if asset["enabled"] and asset["status"] == "OFFLINE"
-    ]
-    if offline_assets:
-        names = ", ".join(asset["name"] for asset in offline_assets[:5])
+    alerts = active_alerts(DATABASE_PATH)
+    if alerts:
+        names = ", ".join(alert["name"] for alert in alerts[:5])
         more = (
-            f" e mais {len(offline_assets) - 5}"
-            if len(offline_assets) > 5
+            f" e mais {len(alerts) - 5}"
+            if len(alerts) > 5
             else ""
         )
         st.error(
-            f"Alarme: {len(offline_assets)} ativo(s) offline — {names}{more}. "
-            "A sirene será repetida até todos voltarem online.",
+            f"Alerta: {len(alerts)} ativo(s) offline após "
+            f"{DEFAULT_FAILURE_THRESHOLD} falhas consecutivas — {names}{more}. "
+            "A sirene será repetida até a recuperação ou silenciamento.",
             icon=":material/notification_important:",
         )
         st.audio(
@@ -2383,6 +2844,8 @@ def render_live_section(section: str) -> None:
         render_history()
     elif section == "Análises":
         render_analytics()
+    elif section == "Operação":
+        render_operations()
     elif section == "Usuários":
         render_users()
     elif section == "Auditoria":
@@ -2398,7 +2861,13 @@ st.set_page_config(
 initialize_database()
 
 if not st.session_state.get("authenticated") or not current_user_is_active():
-    for key in ("authenticated", "user_id", "username", "role", "must_change_password"):
+    for key in (
+        "authenticated",
+        "user_id",
+        "username",
+        "role",
+        "must_change_password",
+    ):
         st.session_state.pop(key, None)
     render_login()
     st.stop()
@@ -2504,12 +2973,17 @@ with st.sidebar:
     st.divider()
     if st.button("Sair", width="stretch"):
         audit_event("logout", "Sessão encerrada.")
-        for key in ("authenticated", "user_id", "username", "role", "must_change_password"):
+        for key in (
+            "authenticated",
+            "user_id",
+            "username",
+            "role",
+            "must_change_password",
+        ):
             st.session_state.pop(key, None)
         st.rerun()
     st.caption(
-        "Como administrador, mantenha a Visão geral aberta para verificar "
-        "automaticamente os ativos configurados a cada 3 segundos."
+        "Use a seção Operação para configurar monitoramento, relatórios e backup."
     )
 
 st.title("Sentinela 3.0")
@@ -2523,7 +2997,7 @@ if flash:
         st.success(message)
 sections = ["Visão geral", "Ativos", "Redes /24", "Histórico", "Análises"]
 if is_admin:
-    sections.extend(["Usuários", "Auditoria"])
+    sections.extend(["Operação", "Usuários", "Auditoria"])
 nav_col, action_col = st.columns([3, 1], vertical_alignment="bottom")
 with nav_col:
     section = st.segmented_control(

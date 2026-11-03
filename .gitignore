@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 netwatch.db
+.streamlit/secrets.toml
+*.sqlite3
+*.bak

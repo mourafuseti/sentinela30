@@ -10,10 +10,15 @@ No PowerShell, dentro da pasta do projeto:
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+```
+
+Inicie o painel:
+
+```powershell
 streamlit run app.py
 ```
 
-O Streamlit abrirá o dashboard no navegador. Os ativos, as redes, os usuários e as verificações ficam no arquivo local `netwatch.db`.
+Os ativos, as redes, os usuários e as verificações ficam no arquivo local `netwatch.db`.
 
 ## Acesso e perfis
 
@@ -33,10 +38,14 @@ O servidor está configurado para escutar somente em `127.0.0.1`. Para acesso po
 
 - **IPs:** cadastre somente o endereço; a porta fica sem configuração inicial. Opcionalmente, configure uma porta TCP específica na edição do ativo.
 - **Sites:** teste HTTP/HTTPS; redirecionamentos não são seguidos.
-- **Monitoramento ao vivo:** na **Visão geral**, administradores verificam automaticamente a cada 3 segundos somente sites habilitados e IPs com porta TCP configurada. O monitoramento roda enquanto a sessão está aberta nessa tela; não executa Nmap nem varre sub-redes.
+- **Inventário:** os ativos aceitam responsável, criticidade, ambiente, localização, tags e observações, além de nome, endereço e porta de verificação.
+- **Monitoramento ao vivo:** em **Operação**, escolha o intervalo de 5, 15, 30 ou 60 segundos e o modo Painel, Processo separado ou Desativado. No modo Painel, a Visão geral atualiza a tela a cada 5 segundos e executa verificações no intervalo configurado; somente sites habilitados e IPs com porta TCP configurada são sondados. Não executa Nmap nem varre sub-redes.
+- **Processo separado:** selecione o modo de processo separado em **Operação** e execute `python monitor_worker.py` para manter o monitor rodando. `python monitor_worker.py --once` executa um ciclo e encerra, para uso com o Agendador de Tarefas do Windows. O processo lê o mesmo SQLite e respeita o modo e o intervalo configurados; não execute várias instâncias simultâneas.
 - **Latência e disponibilidade:** a tabela e o gráfico da **Visão geral** se atualizam a cada ciclo. Uma amostra histórica é persistida no máximo a cada 60 segundos por ativo para evitar crescimento excessivo do banco; a leitura de status permanece em tempo real.
 - **Análises:** a seção **Análises** apresenta disponibilidade observada, contagens online/offline e latência média, com filtros por ativo e por período (24 horas, 7 dias ou 30 dias). As séries são agregadas em intervalos de cinco minutos ou uma hora para manter os gráficos legíveis.
-- **Alarme:** se um ativo habilitado ficar offline, uma sirene em loop aparece na **Visão geral** e para quando todos voltarem online. O navegador pode bloquear reprodução automática; nesse caso, use o controle de áudio exibido.
+- **Alertas:** um ativo gera alerta após duas falhas consecutivas. A sirene em loop aparece na Visão geral até a recuperação; pode ser silenciada por 30 minutos, 1, 4 ou 8 horas na seção **Operação**. O navegador pode bloquear reprodução automática; nesse caso, use o controle de áudio exibido.
+- **Manutenção:** edite um ativo para agendar uma janela de manutenção; o monitor deixa de sondá-lo e não toca sirene até o horário final.
+- **Relatórios e backup:** a seção **Operação** exporta o histórico de até 30 dias em CSV e PDF. Também permite baixar o backup SQLite e restaurar um arquivo validado; antes de restaurar, uma cópia do banco atual é preservada ao lado do banco.
 - **Verificação manual:** o botão **Verificar agora** continua disponível fora da **Visão geral**, com timeout de 3 segundos por ativo.
 - **Redes /24:** cadastra faixas IPv4 para organizar e limitar os resultados importados ao inventário correto.
 - **Importação de Nmap:** abra **Redes /24**, selecione a faixa e envie o relatório XML da verificação autorizada. O app importa os hosts IPv4 ativos da faixa selecionada, os nomes de host e as portas/serviços que o arquivo reporta como abertos. O arquivo fica limitado a 5 MB.
@@ -45,19 +54,13 @@ O servidor está configurado para escutar somente em `127.0.0.1`. Para acesso po
 - **Limite da importação:** relatórios XML são filtrados pela rede selecionada. Portas ausentes em um relatório não são marcadas como fechadas.
 - **IP importado:** recebe o hostname do relatório quando disponível; sem hostname, recebe o nome provisório `Dispositivo <IP>`. IPs cadastrados sem porta não são sondados pelo botão **Verificar agora**. As portas/serviços descobertos no relatório XML também aparecem no inventário de **Ativos**. Cadastre manualmente IPs da lista do roteador pelo campo expansível da tela **Redes /24**.
 - **Redes:** edite o nome ou CIDR, ou exclua a faixa pela seção **Redes /24**. Excluir a faixa não apaga os IPs do inventário nem seus históricos.
-- **Atualização das outras telas:** Ativos, Redes /24, Histórico, Usuários e Auditoria são recarregados a cada 30 segundos. Só a Visão geral executa verificações automáticas.
+- **Atualização das outras telas:** Ativos, Redes /24, Histórico, Usuários, Operação e Auditoria são recarregados a cada 30 segundos. Só o modo Painel na Visão geral executa verificações automáticas.
 - **Dados:** cadastros e histórico persistidos localmente em SQLite.
 
-Verifique apenas endereços que você administra ou tem autorização para monitorar. Um teste TCP confirma acesso à porta, não a disponibilidade de todos os serviços do equipamento. O intervalo de 3 segundos gera tráfego contínuo para cada ativo configurado; use-o apenas em ativos autorizados e reduza a frequência se isso sobrecarregar a rede ou os serviços.
+Verifique apenas endereços que você administra ou tem autorização para monitorar. Um teste TCP confirma acesso à porta, não a disponibilidade de todos os serviços do equipamento. Ajuste o intervalo conforme a capacidade da rede e dos serviços.
 
-## Opções de evolução para o projeto de graduação
+## Próximas melhorias possíveis
 
-1. **Autenticação mais forte:** TOTP/MFA, política de sessão e recuperação segura de conta.
-2. **RBAC granular:** permissões separadas para inventário, monitoramento, importação e gestão de contas.
-3. **Alertas defensivos:** notificações de indisponibilidade, mudança de serviço ou novo ativo, com regras configuráveis.
-4. **Auditoria robusta:** exportação, retenção configurável e envio para um SIEM/syslog com controles de integridade.
-5. **Inventário enriquecido:** proprietário, criticidade, sistema operacional, localização, tags e ciclo de vida.
-6. **Hardening e qualidade:** HTTPS, backup/restauração, testes automatizados de autorização, validação de entradas e análise estática.
-7. **Relatórios acadêmicos:** métricas de disponibilidade, ativos sem responsável e mudanças observadas, com escopo e autorização documentados.
+O projeto inclui perfis Administrador/Visitante, metadados de inventário, manutenção, alertas, relatórios CSV/PDF e backup/restauração. Como próximos passos, considere testes automatizados de autorização e migrações, RBAC mais granular, políticas de retenção e exportação controlada de auditoria, além de HTTPS e gestão de sessão antes de qualquer implantação multiusuário.
 
 Mantenha verificações de rede manuais e limitadas aos ativos autorizados. Não transforme importações de inventário em varreduras automáticas abrangentes.
