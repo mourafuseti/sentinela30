@@ -1632,7 +1632,11 @@ def render_assets(assets: list[dict[str, Any]]) -> None:
             "Tipo": asset["kind"],
             "Endereço": asset["target"],
             "Porta de verificação TCP": (
-                asset["port"] or "Não definida" if asset["kind"] == "IP" else "—"
+                str(asset["port"])
+                if asset["kind"] == "IP" and asset["port"] is not None
+                else "Não definida"
+                if asset["kind"] == "IP"
+                else "—"
             ),
             "Portas encontradas (XML)": (
                 asset["discovered_services"] or "Nenhuma porta importada"
